@@ -1,0 +1,10 @@
+# Normalise line endings. Scripts that Windows runs keep CRLF; everything else LF.
+* text=auto
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.iss text eol=lf
+*.spec text eol=lf
+*.png binary
+*.ico binary

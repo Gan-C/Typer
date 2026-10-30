@@ -1,0 +1,14 @@
+# Core app: typing into other windows + the native GUI.
+#
+# Windows needs NOTHING here (it uses the Python standard library + ctypes).
+# macOS and Linux need pynput for keystrokes; macOS also needs pyobjc for
+# window focus, and Linux needs the `xdotool` command (install it with your
+# package manager, e.g.  sudo apt install xdotool).
+
+pynput>=1.7 ; sys_platform != "win32"
+pyobjc-framework-Cocoa>=9.0 ; sys_platform == "darwin"
+pyobjc-framework-Quartz>=9.0 ; sys_platform == "darwin"
+
+# The native GUI uses tkinter, which ships with Python on Windows and macOS.
+# On Linux install it from your package manager if missing:
+#   Debian/Ubuntu:  sudo apt install python3-tk

@@ -1,0 +1,23 @@
+# Optional: the offline "revise while typing" feature.
+#
+# This runs DistilGPT-2 locally on the CPU (no GPU needed). Install only
+# if you want that feature; the rest of Typer works without it.
+#
+#   pip install -r requirements-revise.txt
+#
+# PyTorch is a large download. For the small CPU-only build (recommended - all Typer
+# needs), install torch like this FIRST, then run the pip command above:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Plain "pip install torch" on Windows pulls the ~2 GB CUDA (GPU) build, which Typer
+# never uses - the CPU wheels are a fraction of the size with no loss of function.
+#
+# Mainland China: Hugging Face is slow/blocked, so set a mirror before the one-time
+# model download (run_typer.bat already does this):
+#
+#   Windows:        set HF_ENDPOINT=https://hf-mirror.com
+#   macOS / Linux:  export HF_ENDPOINT=https://hf-mirror.com
+
+torch>=2.0
+transformers>=4.30

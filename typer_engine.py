@@ -58,6 +58,12 @@ DEFAULT_SETTINGS = {
     "rich_text": False,        # rich-text editor on/off (UI-only; formatting is passed separately)
     "lock_cursor": False,      # block the mouse while typing so accidental clicks can't disrupt it
     "match_document": False,   # "revise to match": edit what is already in the target to fit this text
+    # typed "trigger word" shortcuts (global). UI-only here; the app wires them to a listener.
+    "trig_enabled": True,      # watch for the trigger words below
+    "trig_hide": "qqq",        # hide / show the Typer window (and raise it)
+    "trig_pauseresume": "www", # pause / resume typing
+    "trig_start": "",          # start typing (blank = off)
+    "trig_stop": "",           # stop typing (blank = off)
 }
 
 # Formatting shortcuts emitted into the target document. These are the near-universal
@@ -98,6 +104,49 @@ def sanitize_settings(incoming: dict, base: dict | None = None) -> dict:
     out["revise_every"] = int(_clamp(out["revise_every"], 1, 200))
     out["model"] = out["model"].strip() or DEFAULT_SETTINGS["model"]
     return out
+
+
+# --------------------------------------------------------------------------- trigger words
+
+class HotStringMatcher:
+    """Watches a stream of typed characters for short 'trigger words' and reports which
+    action each completed one fires. Pure logic (no OS); the global key listener feeds
+    it one character at a time. Matching is case-insensitive and looks at the tail of a
+    small rolling buffer, so a trigger fires as soon as its letters have just been typed.
+    A non-character key (Space, Enter, ...) is fed as None and clears the buffer, so a
+    trigger only fires from a contiguous run of letters/digits."""
+
+    def __init__(self, mapping: dict | None = None):
+        self._triggers: dict[str, str] = {}
+        self._buf = ""
+        self._max = 0
+        if mapping:
+            self.set_triggers(mapping)
+
+    def set_triggers(self, mapping: dict) -> None:
+        # {trigger-string: action-name}; blank strings are ignored
+        self._triggers = {}
+        for s, action in (mapping or {}).items():
+            s = (s or "").strip().lower()
+            if s:
+                self._triggers[s] = action
+        self._max = max((len(s) for s in self._triggers), default=0)
+        self._buf = ""
+
+    def feed(self, ch: str | None):
+        """Feed one character (or None for a separator key). Returns (action, length)
+        when a trigger just completed, otherwise None."""
+        if not self._triggers:
+            return None
+        if ch is None or len(ch) != 1 or not (ch.isalnum()):
+            self._buf = ""
+            return None
+        self._buf = (self._buf + ch.lower())[-self._max:]
+        for s, action in self._triggers.items():
+            if self._buf.endswith(s):
+                self._buf = ""
+                return (action, len(s))
+        return None
 
 
 # --------------------------------------------------------------------------- keyboard geometry
@@ -1214,6 +1263,117 @@ if sys.platform == "win32":
                 self._tid = 0
                 self._proc = None
 
+    # --- global trigger-word listener (low-level keyboard hook) ---
+    WH_KEYBOARD_LL = 13
+    LLKHF_INJECTED = 0x10          # set on keystrokes WE inject (SendInput) -> ignore them
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    def _vk_to_char(vk: int):
+        """The character a virtual-key would type for trigger matching, or None for any
+        key that is not a letter/digit (which resets the match buffer).  Deliberately
+        layout- and shift-agnostic: triggers are lowercase alnum run-ons like 'qqq'."""
+        if 0x41 <= vk <= 0x5A:            # A-Z
+            return chr(vk).lower()
+        if 0x30 <= vk <= 0x39:            # 0-9 (top row)
+            return chr(vk)
+        if 0x60 <= vk <= 0x69:            # numpad 0-9
+            return chr(0x30 + vk - 0x60)
+        return None
+
+    class _KeyHook:
+        """Watches the user's PHYSICAL typing globally (any window) and fires a handler
+        when a trigger word is completed.  Injected keystrokes -- Typer's own typing and
+        the backspaces below -- carry LLKHF_INJECTED and are ignored, so Typer never
+        triggers itself.  The matched trigger is erased with Backspace so it doesn't get
+        left behind in whatever the user was typing into.
+
+        Runs a low-level keyboard hook on its own message-pump thread.  Fails OPEN: if the
+        hook can't be installed the triggers simply don't fire -- the keyboard is never
+        left blocked (the proc always calls the next hook and never swallows a key)."""
+
+        def __init__(self, matcher, on_fire, backspace):
+            self._matcher = matcher        # HotStringMatcher
+            self._on_fire = on_fire        # on_fire(action) -- runs on a worker thread
+            self._backspace = backspace    # backspace(n) -- erase the n trigger chars
+            self._on = False
+            self._thread = None
+            self._tid = 0
+            self._proc = None              # keep the CFUNCTYPE alive while hooked
+            self._lock = threading.Lock()
+
+        def set(self, on: bool) -> None:
+            with self._lock:
+                if on and not self._on:
+                    self._on = True
+                    self._thread = threading.Thread(target=self._run, name="typer-keyhook", daemon=True)
+                    self._thread.start()
+                elif not on and self._on:
+                    self._on = False
+                    if self._tid:
+                        try:
+                            user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+                        except Exception:
+                            pass
+
+        def update(self, matcher) -> None:
+            self._matcher = matcher
+
+        def _fire(self, action, length) -> None:
+            try:
+                self._backspace(length)
+            except Exception:
+                pass
+            try:
+                self._on_fire(action)
+            except Exception:
+                pass
+
+        def _run(self) -> None:
+            def proc(nCode, wParam, lParam):
+                try:
+                    if (nCode == HC_ACTION and self._on
+                            and int(wParam) in (WM_KEYDOWN, WM_SYSKEYDOWN)):
+                        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        if not (kb.flags & LLKHF_INJECTED):
+                            hit = self._matcher.feed(_vk_to_char(kb.vkCode))
+                            if hit:
+                                action, length = hit
+                                # do the erase + handler off the hook thread so the
+                                # proc returns immediately (never stalls the keyboard)
+                                threading.Thread(target=self._fire, args=(action, length),
+                                                  name="typer-trigger", daemon=True).start()
+                except Exception:
+                    pass
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            self._proc = HOOKPROC(proc)
+            try:
+                hmod = kernel32.GetModuleHandleW(None)
+                hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, hmod, 0)
+            except Exception:
+                hook = None
+            if not hook:
+                self._proc = None
+                return
+            self._tid = kernel32.GetCurrentThreadId()
+            msg = wintypes.MSG()
+            try:
+                while self._on and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            finally:
+                try:
+                    user32.UnhookWindowsHookEx(hook)
+                except Exception:
+                    pass
+                self._tid = 0
+                self._proc = None
+
     class WindowsKeyboard:
         """Real keystrokes.
 
@@ -1474,3 +1634,25 @@ def make_platform_backend():
         return WindowsKeyboard(), WindowsFocus()
     from typer_backends_posix import make_posix_backend
     return make_posix_backend()
+
+
+def make_hotstring_listener(matcher, on_fire):
+    """A global trigger-word listener for this machine, or None if the platform has none.
+
+    `matcher` is a HotStringMatcher the caller keeps a handle on (so it can swap the
+    trigger words live with matcher.set_triggers(...)).  `on_fire(action)` is called -- on
+    a background thread -- with the action name of whichever trigger the user just typed.
+
+    Only Windows ships a global keyboard hook.  macOS/Linux return None, and the GUI
+    hides the shortcuts section there (pynput could do it but needs Accessibility/root and
+    isn't wired up yet)."""
+    if sys.platform != "win32":
+        return None
+    kb = WindowsKeyboard()
+    def backspace(n: int) -> None:
+        for _ in range(max(0, int(n))):
+            try:
+                kb.press("backspace")
+            except Exception:
+                pass
+    return _KeyHook(matcher, on_fire, backspace)

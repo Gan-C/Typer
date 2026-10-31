@@ -27,7 +27,10 @@ from tkinter import ttk, messagebox, font as tkfont
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from typer_engine import DEFAULT_SETTINGS, TyperEngine, make_platform_backend, sanitize_settings  # noqa: E402
+from typer_engine import (  # noqa: E402
+    DEFAULT_SETTINGS, TyperEngine, HotStringMatcher,
+    make_platform_backend, make_hotstring_listener, sanitize_settings,
+)
 import typer_revise_local as rev  # noqa: E402
 
 APP_TITLE = "Typer (local)"      # must match SELF_TITLE in typer_engine so it's never typed into
@@ -74,6 +77,13 @@ FONT = ("Segoe UI", 10) if sys.platform == "win32" else ("Helvetica", 11)
 MONO = ("Consolas", 10) if sys.platform == "win32" else ("DejaVu Sans Mono", 10)
 
 
+def _clean_trigger(s: str) -> str:
+    """A trigger word can only ever match a run of letters/digits (the matcher resets on
+    anything else), so keep just those and lowercase them — a stray space would otherwise
+    make the trigger impossible to fire."""
+    return "".join(c for c in (s or "") if c.isalnum()).lower()
+
+
 def load_config() -> dict:
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -106,8 +116,18 @@ class TyperApp:
         if self.engine:
             self.engine.update_settings(load_config())
         self.settings = dict(self.engine.settings if self.engine else load_config())
+        # global typed-trigger listener (Windows only; None elsewhere). The matcher is
+        # shared, so changing the trigger words later just updates it in place.
+        self._matcher = HotStringMatcher()
+        try:
+            self._listener = make_hotstring_listener(self._matcher, self._on_trigger_fire)
+        except Exception:
+            self._listener = None
+        self.folded = False
+        self._saved_geom = None
         self._build()
         self._apply_settings_to_widgets()
+        self._sync_triggers()
         self._save_job = None
         if self.engine:
             self._poll()
@@ -186,20 +206,38 @@ class TyperApp:
 
         self._init_styles()
 
-        # ---- header: title, live status, keep-on-top
+        # ---- header: title, live status, keep-on-top, fold-to-banner
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=20, pady=(16, 10))
+        self.header = header
         ttk.Label(header, text="Typer", style="Title.TLabel").pack(side="left")
         self.chip_var = tk.StringVar(value="● Idle")
         self.chip = ttk.Label(header, textvariable=self.chip_var, style="Chip.TLabel")
         self.chip.pack(side="left", padx=(12, 0))
+        # Fold-to-banner arrow. Tkinter can't add a button to the native title bar, so
+        # this sits at the right edge of our own header (as close to Minimize as we can
+        # get) rather than literally beside it.
+        self.fold_btn = ttk.Button(header, text="▲", width=3, style="Ghost.TButton",
+                                    command=self._toggle_fold)
+        self.fold_btn.pack(side="right")
         self.ontop_var = tk.BooleanVar(value=True)
         self.ontop_chk = ttk.Checkbutton(header, text="Keep on top", variable=self.ontop_var,
                                          command=self._on_ontop, style="Toggle.TCheckbutton")
-        self.ontop_chk.pack(side="right")
+        self.ontop_chk.pack(side="right", padx=(0, 12))
+        # compact controls that appear in the header only while folded into a banner
+        self.banner_box = ttk.Frame(header)
+        self.banner_stats = tk.StringVar(value="")
+        ttk.Label(self.banner_box, textvariable=self.banner_stats, style="Chip.TLabel").pack(side="left", padx=(0, 10))
+        self.banner_pause = ttk.Button(self.banner_box, text="Pause", width=7, style="Ghost.TButton",
+                                       command=self._on_pause, state="disabled")
+        self.banner_pause.pack(side="left", padx=(0, 6))
+        self.banner_stop = ttk.Button(self.banner_box, text="Stop", width=6, style="Ghost.TButton",
+                                      command=self._on_stop, state="disabled")
+        self.banner_stop.pack(side="left")
 
         # ---- body: two cards side by side
         body = ttk.Frame(self.root)
+        self.body = body
         body.pack(fill="both", expand=True, padx=20, pady=(0, 18))
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
@@ -496,10 +534,139 @@ class TyperApp:
         self.dl_btn = ttk.Button(drow, text="Set up model", style="Ghost.TButton", command=self._on_download)
         # the button is packed only when the model isn't ready (see _refresh_model_status)
 
+        # ---- Typed shortcuts (global trigger words)
+        sc = self._section(parent, "Typed shortcuts")
+        win_ok = self._listener is not None
+        self.trigen_var = tk.BooleanVar(value=True)
+        self.trigen_chk = ttk.Checkbutton(sc, text="Watch for trigger words", variable=self.trigen_var,
+                                          command=self._on_change, style="Card.TCheckbutton")
+        self.trigen_chk.pack(anchor="w")
+        ttk.Label(sc, text=("Type these anywhere — even when Typer isn't focused — to control it. "
+                            "The letters erase themselves as you type them."
+                            if win_ok else "Windows only — not active on this platform."),
+                  style="CardFaint.TLabel", wraplength=300, justify="left").pack(anchor="w", pady=(0, 4))
+        self.trig_hide_var = tk.StringVar(value="qqq")
+        self.trig_pr_var = tk.StringVar(value="www")
+        self.trig_start_var = tk.StringVar(value="")
+        self.trig_stop_var = tk.StringVar(value="")
+        self._trig_entries = []
+        for label, var in (("Hide / show window", self.trig_hide_var),
+                           ("Pause / resume", self.trig_pr_var),
+                           ("Start typing", self.trig_start_var),
+                           ("Stop typing", self.trig_stop_var)):
+            r = ttk.Frame(sc, style="Card.TFrame"); r.pack(fill="x", pady=(5, 0))
+            ttk.Label(r, text=label, style="Card.TLabel").pack(side="left")
+            e = tk.Entry(r, width=10, textvariable=var, justify="center",
+                         bg=INPUT, fg=TEXT, insertbackground=ACCENT, relief="flat",
+                         highlightthickness=1, highlightbackground=LINE, highlightcolor=LINE)
+            e.pack(side="right")
+            e.bind("<FocusOut>", lambda ev: self._on_change())
+            e.bind("<Return>", lambda ev: self._on_change())
+            self._trig_entries.append(e)
+        ttk.Label(sc, text="Leave Start / Stop blank to turn them off.",
+                  style="CardFaint.TLabel", wraplength=300, justify="left").pack(anchor="w", pady=(6, 0))
+        if not win_ok:
+            try:
+                self.trigen_chk.config(state="disabled")
+                for e in self._trig_entries:
+                    e.config(state="disabled")
+            except Exception:
+                pass
+
         # ---- footer
         tk.Frame(parent, bg=LINE, height=1).pack(fill="x", padx=18, pady=(16, 0))
         ttk.Label(parent, text="Everything runs on this computer. Delete and Insert are never pressed.",
                   style="CardFaint.TLabel", wraplength=300, justify="left").pack(anchor="w", padx=18, pady=(12, 16))
+
+    # ----------------------------------------------------------------- fold to banner
+    def _toggle_fold(self):
+        self._set_folded(not self.folded)
+
+    def _set_folded(self, folded: bool):
+        folded = bool(folded)
+        if folded == self.folded:
+            return
+        self.folded = folded
+        if folded:
+            try:
+                self._saved_geom = self.root.geometry()
+            except Exception:
+                self._saved_geom = None
+            self.body.pack_forget()
+            self.ontop_chk.pack_forget()
+            self.banner_box.pack(side="right", padx=(0, 12))
+            self.fold_btn.config(text="▼")
+            try:
+                self.root.update_idletasks()
+                w = max(self.root.winfo_width(), 460)
+                h = self.header.winfo_reqheight() + 28
+                self.root.minsize(360, 1)
+                self.root.geometry(f"{w}x{h}")
+            except Exception:
+                pass
+        else:
+            self.banner_box.pack_forget()
+            self.ontop_chk.pack(side="right", padx=(0, 12))
+            self.body.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+            self.fold_btn.config(text="▲")
+            try:
+                self.root.minsize(880, 560)
+                if self._saved_geom:
+                    self.root.geometry(self._saved_geom)
+                else:
+                    self.root.geometry("")
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------------- typed triggers
+    def _on_trigger_fire(self, action: str):
+        """Called on the keyboard-hook's background thread; hop onto the UI thread."""
+        try:
+            self.root.after(0, lambda a=action: self._do_trigger(a))
+        except Exception:
+            pass
+
+    def _do_trigger(self, action: str):
+        if action == "hide":
+            self._toggle_hidden()
+        elif action == "pauseresume":
+            self._on_pause()
+        elif action == "start":
+            self._on_start()
+        elif action == "stop":
+            self._on_stop()
+
+    def _toggle_hidden(self):
+        """qqq-style panic toggle: hide the window, or bring it back on top. The trigger
+        listener is global, so typing the word again re-shows it even while hidden."""
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+                self.root.lift()
+                self._apply_ontop(self.ontop_var.get())
+            else:
+                self.root.withdraw()
+        except Exception:
+            pass
+
+    def _sync_triggers(self):
+        """Load the current trigger words into the shared matcher and switch the global
+        listener on/off. Safe to call on every settings change."""
+        if not getattr(self, "_matcher", None):
+            return
+        s = self.settings
+        mapping = {}
+        for key, action in (("trig_hide", "hide"), ("trig_pauseresume", "pauseresume"),
+                            ("trig_start", "start"), ("trig_stop", "stop")):
+            word = (s.get(key) or "").strip().lower()
+            if word:
+                mapping[word] = action
+        self._matcher.set_triggers(mapping)
+        if self._listener:
+            try:
+                self._listener.set(bool(s.get("trig_enabled", True)) and bool(mapping))
+            except Exception:
+                pass
 
     # ----------------------------------------------------------------- settings <-> widgets
     def _apply_settings_to_widgets(self):
@@ -522,6 +689,11 @@ class TyperApp:
         self.lockcur_var.set(bool(s.get("lock_cursor", False)))
         self.match_var.set(bool(s.get("match_document", False)))
         self._on_match_toggle(save=False)
+        self.trigen_var.set(bool(s.get("trig_enabled", True)))
+        self.trig_hide_var.set(str(s.get("trig_hide", "qqq")))
+        self.trig_pr_var.set(str(s.get("trig_pauseresume", "www")))
+        self.trig_start_var.set(str(s.get("trig_start", "")))
+        self.trig_stop_var.set(str(s.get("trig_stop", "")))
         key = s.get("model", rev.DEFAULT_MODEL)
         if key in rev.MODELS:
             self.model_var.set(rev.MODELS[key]["label"])
@@ -546,6 +718,11 @@ class TyperApp:
             "rich_text": bool(self.rich_var.get()),
             "lock_cursor": bool(self.lockcur_var.get()),
             "match_document": bool(self.match_var.get()),
+            "trig_enabled": bool(self.trigen_var.get()),
+            "trig_hide": _clean_trigger(self.trig_hide_var.get()),
+            "trig_pauseresume": _clean_trigger(self.trig_pr_var.get()),
+            "trig_start": _clean_trigger(self.trig_start_var.get()),
+            "trig_stop": _clean_trigger(self.trig_stop_var.get()),
         }
 
     def _refresh_derived(self):
@@ -584,6 +761,7 @@ class TyperApp:
         self.settings = sanitize_settings(self._read_widgets())
         if self.engine:
             self.engine.update_settings(self.settings)
+        self._sync_triggers()
         if self._save_job:
             self.root.after_cancel(self._save_job)
         self._save_job = self.root.after(300, lambda: save_config(self.settings))
@@ -710,8 +888,19 @@ class TyperApp:
         else:
             self.target_var.set("Click into your document first")
         self.keys_var.set("While running:  F8 pause/resume  ·  F9 stop  (from any window)" if s.get("hotkeys") else "")
+        if self.folded:
+            self.banner_stats.set(f"{s['progress']}/{s['total']}" if s["total"] else "")
+            self.banner_pause.config(
+                state=("normal" if active and s["state"] != "countdown" else "disabled"),
+                text="Resume" if s["state"] == "paused" else "Pause")
+            self.banner_stop.config(state=("normal" if active else "disabled"))
 
     def _on_close(self):
+        if self._listener:
+            try:
+                self._listener.set(False)
+            except Exception:
+                pass
         if self.engine:
             self.engine.stop()
             save_config(self.settings)

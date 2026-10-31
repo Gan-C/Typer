@@ -74,6 +74,15 @@ button.
 4. **Pause/Resume**, **Stop**, and the global **F8** (pause/resume) / **F9** (stop)
    hotkeys work while it runs.
 
+You can **fold the window into a slim banner** with the **▲** button at the top-right of
+the header (click **▼** to unfold). The banner keeps the live status, a progress count
+and Pause/Stop within reach while taking up almost no screen — handy for tucking it in a
+corner while it types into your document. (Tkinter can't place a button on the native
+title bar, so the arrow lives at the right edge of Typer's own header rather than right
+beside Minimize.)
+
+You can also drive Typer with **typed shortcuts** from any window — see the table below.
+
 ## Settings
 
 | Setting | What it does |
@@ -82,6 +91,7 @@ button.
 | Keep on top | Top-of-window tick box. Keeps the Typer window above other windows so it is never hidden behind the document it types into. On by default; remembered between runs. |
 | Lock cursor | While Typer is typing, blocks mouse **clicks** (and the wheel) on the target window, so an accidental tap or trackpad brush can't move the caret or select text and ruin the output. The pointer still moves; only clicks are swallowed. The keyboard is untouched, so **F8/F9** still pause/stop. Windows only (no effect on macOS/Linux); fails *open* — if anything goes wrong clicks simply aren't blocked, the mouse is never left stuck. Off by default. |
 | Match document (revise to fit) | A different mode: instead of typing your text in fresh, Typer reads **what's already in the target** (via Select-All + Copy), compares it to the text in the box, and edits the document **in place, from the top down** — typing in the missing paragraphs/sentences/words and Backspacing over the extra ones — until it matches. Corrections still never use the Delete key (only Backspace + the arrow keys). Best in a document editor; it briefly uses your clipboard. Off by default. |
+| Typed shortcuts | Short **trigger words** you can type in *any* window — even when Typer isn't focused — to control it without reaching for the mouse. As you finish a trigger it fires the action and the letters **erase themselves** (Backspace) so they don't litter whatever you were typing into. Defaults: **`qqq`** hides / re-shows the Typer window, **`www`** pauses / resumes typing. Two more (start, stop) are blank by default; fill them in to enable. Each word is editable, and the whole feature has an on/off switch. Windows only (it uses a global keyboard hook); mac/Linux show the section greyed out. Pick words you'd never type by accident — note `www` will fire inside `www.` web addresses, so change it if that bothers you. |
 | Words per minute | Average speed. The live speed drifts up to 30 WPM either side and averages the number you set. Adjustable while typing. |
 | Line breaks | Seconds to pause after Enter. Tick **Random length** for a min/max picked each time. Untick **Pause at line breaks** to turn the pause off entirely — line breaks are still typed, just with no extra wait. |
 | Error rate | Share of letters that go wrong. **Word errors** hit a neighbouring QWERTY key; **order errors** swap two letters. Both are fixed with Backspace. |

@@ -646,6 +646,38 @@ def test_match_document_edits_existing_text_to_match():
     assert st["edits_inserted"] > 0 and st["edits_deleted"] > 0
 
 
+def test_hotstring_matcher_fires_on_trigger_words():
+    from typer_engine import HotStringMatcher
+    m = HotStringMatcher({"qqq": "hide", "www": "pauseresume", "": "ignored"})
+
+    def feed(s):
+        out = []
+        for ch in s:
+            out.append(m.feed(None if ch in " \n\t" else ch))
+        return [r for r in out if r]
+
+    assert feed("qq") == []                      # not yet
+    assert feed("q") == [("hide", 3)]            # the third q completes qqq
+    assert feed("type www here") == [("pauseresume", 3)]
+    assert feed("aqqq") == [("hide", 3)]         # fires on the tail of a run
+    assert feed("q q q") == []                   # spaces break the run, so no match
+    m.set_triggers({})                           # no triggers -> never fires
+    assert feed("qqqwww") == []
+
+
+def test_hotstring_matcher_case_digits_and_repeat():
+    from typer_engine import HotStringMatcher
+    m = HotStringMatcher({"QqQ": "hide", "g0": "start"})   # mixed case + a digit
+
+    def feed(s):
+        return [r for r in (m.feed(None if ch in " \n\t" else ch) for ch in s) if r]
+
+    assert feed("QQQ") == [("hide", 3)]          # trigger stored lower, input upper -> matches
+    assert feed("qqq") == [("hide", 3)]          # fires again right after (buffer cleared)
+    assert feed("g0") == [("start", 2)]          # digits are part of a trigger run
+    assert feed("xxg0") == [("start", 2)]        # fires on the tail
+
+
 def test_match_document_into_empty_target_types_it_all():
     desired = "Nothing was here before, so all of this gets typed in fresh."
     eng, kb, _ = make_engine(seed=4, match_document=True)

@@ -604,6 +604,59 @@ def test_plain_text_emits_no_formatting_shortcuts():
     assert chords_used(kb) == []
 
 
+# --------------------------------------------------------------------------- lock cursor
+
+def mouse_locks(kb):
+    return [on for (_, kind, on) in kb.events if kind == "mouselock"]
+
+
+def test_lock_cursor_blocks_mouse_while_typing_then_releases():
+    eng, kb, _ = make_engine(seed=1, lock_cursor=True)
+    run_to_end(eng, "The quick brown fox jumps over the lazy dog, again and again.")
+    locks = mouse_locks(kb)
+    assert True in locks, "the mouse should be locked while typing"
+    assert locks[-1] is False, "the mouse must always be released at the end"
+
+
+def test_lock_cursor_off_by_default_never_locks_the_mouse():
+    eng, kb, _ = make_engine(seed=1)
+    run_to_end(eng, "The quick brown fox jumps over the lazy dog.")
+    assert True not in mouse_locks(kb)
+
+
+# --------------------------------------------------------------------------- revise to match
+
+def test_match_document_edits_existing_text_to_match():
+    existing = ("The quick brown fox jumps over the lazy dog.\n"
+                "This whole middle line should be removed.\n"
+                "A shared closing line.")
+    desired = ("The quick red fox leaps over the lazy dog.\n"
+               "A shared closing line.\n"
+               "Plus a brand new paragraph at the end.")
+    eng, kb, _ = make_engine(seed=3, match_document=True)
+    kb.doc.buf = list(existing)          # the target already holds this text
+    kb.doc.caret = len(existing)
+    ok, msg = eng.start(desired)
+    assert ok, msg
+    eng.join(60.0)
+    assert not eng._thread.is_alive()
+    assert kb.doc.text == desired        # the document now matches exactly
+    st = eng.status()
+    assert st["state"] == "done" and st["match"] is True
+    assert st["edits_inserted"] > 0 and st["edits_deleted"] > 0
+
+
+def test_match_document_into_empty_target_types_it_all():
+    desired = "Nothing was here before, so all of this gets typed in fresh."
+    eng, kb, _ = make_engine(seed=4, match_document=True)
+    # kb.doc starts empty; read_document returns ""
+    ok, msg = eng.start(desired)
+    assert ok, msg
+    eng.join(60.0)
+    assert kb.doc.text == desired
+    assert eng.status()["edits_inserted"] == len(desired)
+
+
 def test_rich_text_survives_typos_and_still_formats():
     # with a high typo rate, corrections happen inside the bold run; the final
     # document is still exactly the text and bold is toggled on then off once.

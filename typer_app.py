@@ -218,7 +218,8 @@ class TyperApp:
         # header row: label + "Rich text" toggle
         head = ttk.Frame(left, style="Card.TFrame")
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
-        ttk.Label(head, text="TEXT TO TYPE", style="Head.TLabel").pack(side="left")
+        self.text_heading = ttk.Label(head, text="TEXT TO TYPE", style="Head.TLabel")
+        self.text_heading.pack(side="left")
         self.rich_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(head, text="Rich text", variable=self.rich_var,
                         command=self._on_rich_toggle, style="Card.TCheckbutton").pack(side="right")
@@ -308,6 +309,11 @@ class TyperApp:
         if save:
             self._on_change()
 
+    def _on_match_toggle(self, save=True):
+        self.text_heading.config(text="TEXT TO MATCH" if self.match_var.get() else "TEXT TO TYPE")
+        if save:
+            self._on_change()
+
     def _range_has_tag(self, tag, a, b):
         idx = a
         while self.text.compare(idx, "<", b):
@@ -394,8 +400,23 @@ class TyperApp:
         return inner
 
     def _build_settings(self, parent):
+        # ---- While typing (lock cursor + match document)
+        wt = self._section(parent, "While typing", first=True)
+        self.lockcur_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wt, text="Lock cursor", variable=self.lockcur_var,
+                        command=self._on_change, style="Card.TCheckbutton").pack(anchor="w")
+        ttk.Label(wt, text="Blocks mouse clicks on the target while typing, so an accidental tap can't "
+                  "move the caret. F8/F9 still pause/stop.", style="CardFaint.TLabel",
+                  wraplength=300, justify="left").pack(anchor="w")
+        self.match_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wt, text="Match document (revise to fit)", variable=self.match_var,
+                        command=self._on_match_toggle, style="Card.TCheckbutton").pack(anchor="w", pady=(10, 0))
+        ttk.Label(wt, text="Instead of typing fresh, reads what's already in the target and edits it from "
+                  "the top — adding and removing text — until it matches the text on the left.",
+                  style="CardFaint.TLabel", wraplength=300, justify="left").pack(anchor="w")
+
         # ---- Speed
-        sp = self._section(parent, "Speed", first=True)
+        sp = self._section(parent, "Speed")
         self.wpm_var = tk.IntVar(value=60)
         self.wpm_out = tk.StringVar(value="60 WPM")
         row = ttk.Frame(sp, style="Card.TFrame"); row.pack(fill="x")
@@ -498,6 +519,9 @@ class TyperApp:
         self._apply_ontop(self.ontop_var.get())
         self.rich_var.set(bool(s.get("rich_text", False)))
         self._on_rich_toggle(save=False)
+        self.lockcur_var.set(bool(s.get("lock_cursor", False)))
+        self.match_var.set(bool(s.get("match_document", False)))
+        self._on_match_toggle(save=False)
         key = s.get("model", rev.DEFAULT_MODEL)
         if key in rev.MODELS:
             self.model_var.set(rev.MODELS[key]["label"])
@@ -520,6 +544,8 @@ class TyperApp:
             "model": self._model_labels.get(self.model_var.get(), rev.DEFAULT_MODEL),
             "keep_on_top": bool(self.ontop_var.get()),
             "rich_text": bool(self.rich_var.get()),
+            "lock_cursor": bool(self.lockcur_var.get()),
+            "match_document": bool(self.match_var.get()),
         }
 
     def _refresh_derived(self):

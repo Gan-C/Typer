@@ -71,6 +71,49 @@ class PynputKeyboard:
             pass
         self._settle(0.016, 0.028)
 
+    def set_mouse_lock(self, on: bool) -> None:
+        # Blocking the physical mouse cleanly is Windows-specific; left as a no-op on
+        # macOS/Linux (the feature simply has no effect there).
+        return
+
+    def read_document(self) -> str:
+        """Select-all + copy, then read the clipboard (best effort; '' on failure)."""
+        from pynput.keyboard import Key
+        import subprocess
+        mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
+        try:
+            with self._c.pressed(mod):
+                self._c.tap("a")
+            self._settle(0.05, 0.08)
+            with self._c.pressed(mod):
+                self._c.tap("c")
+            self._settle(0.1, 0.15)
+        except Exception:
+            return ""
+        try:
+            if sys.platform == "darwin":
+                return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=3).stdout
+            for cmd in (["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]):
+                if shutil.which(cmd[0]):
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            pass
+        return ""
+
+    def caret_to_start(self) -> None:
+        """Jump to the start of the document (Cmd+Up on macOS, Ctrl+Home elsewhere)."""
+        from pynput.keyboard import Key
+        try:
+            if sys.platform == "darwin":
+                with self._c.pressed(Key.cmd):
+                    self._c.tap(Key.up)
+            else:
+                with self._c.pressed(Key.ctrl):
+                    self._c.tap(Key.home)
+        except Exception:
+            pass
+        self._settle(0.03, 0.05)
+
     def release_all(self) -> None:
         pass
 

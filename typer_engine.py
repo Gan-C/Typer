@@ -56,6 +56,8 @@ DEFAULT_SETTINGS = {
     "model": "distilgpt2",     # local revise model (DistilGPT-2)
     "keep_on_top": True,       # keep the Typer window above other windows (UI-only)
     "rich_text": False,        # rich-text editor on/off (UI-only; formatting is passed separately)
+    "lock_cursor": False,      # block the mouse while typing so accidental clicks can't disrupt it
+    "match_document": False,   # "revise to match": edit what is already in the target to fit this text
 }
 
 # Formatting shortcuts emitted into the target document. These are the near-universal
@@ -229,6 +231,18 @@ class FakeKeyboard:
         # a formatting shortcut (Ctrl+<key>); it changes styling, not the text buffer
         self.events.append((self.clock.now(), "chord", "ctrl+" + str(key).lower()))
 
+    def set_mouse_lock(self, on: bool) -> None:
+        self.events.append((self.clock.now(), "mouselock", bool(on)))
+
+    def read_document(self) -> str:
+        # models Ctrl+A + Ctrl+C: the whole document is what gets "copied"
+        self.events.append((self.clock.now(), "readdoc", ""))
+        return self.doc.text
+
+    def caret_to_start(self) -> None:
+        self.doc.caret = 0
+        self.events.append((self.clock.now(), "caret", "start"))
+
     def release_all(self) -> None:
         pass
 
@@ -344,6 +358,7 @@ class TyperEngine:
         self.total = len(text)
         self._sentences = sentence_spans(text)
         self.fmt = self._coerce_fmt(fmt, len(text))
+        self._match = bool(self.settings.get("match_document"))
         self._stop.clear()
         self._running.set()
         self._set_state("countdown", "Starting...")
@@ -400,6 +415,9 @@ class TyperEngine:
             "revisions": self.revisions,
             "revision_failures": self.revision_failures,
             "last_revision_error": self.last_revision_error,
+            "match": self._match,
+            "edits_inserted": self.edits_inserted,
+            "edits_deleted": self.edits_deleted,
             "hotkeys": bool(getattr(self.focus, "hotkeys_available", False)),
         }
 
@@ -442,12 +460,34 @@ class TyperEngine:
         self._fmt_underline = False
         self._align = "left"
         self.format_log: list[str] = []   # every chord emitted, for tests/inspection
+        self._match = False               # "revise to match" mode (edit the existing document)
+        self.edits_inserted = 0
+        self.edits_deleted = 0
+
+    # typing is "live" (keys going out) in exactly these states
+    _TYPING_STATES = ("typing", "revising", "fixing")
 
     def _set_state(self, state: str, message: str | None = None) -> None:
         with self._lock:
             self.state = state
             if message is not None:
                 self.message = message
+        # the mouse lock follows the typing state: on while keys go out, off otherwise
+        self._mouse_lock(state in self._TYPING_STATES)
+
+    def _mouse_lock(self, on: bool) -> None:
+        """Block (or release) physical mouse clicks on the target while typing, if the
+        backend supports it and the user turned 'lock cursor' on. Releasing is always
+        allowed, so the mouse can never stay stuck off a stale setting."""
+        fn = getattr(self.kb, "set_mouse_lock", None)
+        if fn is None:
+            return
+        if on and not self.settings.get("lock_cursor"):
+            return
+        try:
+            fn(on)
+        except Exception:
+            pass
 
     def _hotkey(self, action: str) -> None:
         if action == "toggle":
@@ -458,11 +498,16 @@ class TyperEngine:
     def _run(self) -> None:
         try:
             self._countdown_phase()
-            self._type_all()
-            self._fix_preserved()
-            self._clear_format()
-            summary = (f"Done. {self.total} characters typed, {self.errors_made} errors made, "
-                       f"{self.errors_fixed} fixed, {self.revisions} revisions.")
+            if self._match:
+                self._match_document()
+                summary = (f"Done matching. {self.edits_inserted} characters added, "
+                           f"{self.edits_deleted} removed.")
+            else:
+                self._type_all()
+                self._fix_preserved()
+                self._clear_format()
+                summary = (f"Done. {self.total} characters typed, {self.errors_made} errors made, "
+                           f"{self.errors_fixed} fixed, {self.revisions} revisions.")
             self._set_state("done", summary)
         except Stopped:
             self._set_state("stopped", "Stopped.")
@@ -471,6 +516,7 @@ class TyperEngine:
         except Exception as e:  # pragma: no cover - defensive
             self._set_state("error", f"Error: {e}")
         finally:
+            self._mouse_lock(False)   # never leave the mouse blocked
             try:
                 self.kb.release_all()
             except Exception:
@@ -919,6 +965,74 @@ class TyperEngine:
         self._set_state("typing", "")
         self._acct_mark = self.now()
 
+    # ----------------------------------------------------------------- revise to match
+
+    def _nav_right(self, n: int) -> None:
+        """Move the caret right n characters, quickly, with the usual pause/focus checks."""
+        for k in range(n):
+            if (k & 31) == 0:
+                self._pause_point()
+                self._guard_focus()
+            self.kb.press("right")
+            self._wait(self.rng.uniform(0.004, 0.012))
+
+    def _type_run(self, s: str) -> None:
+        for ch in s:
+            self._key(ch)
+
+    def _match_document(self) -> None:
+        """Read what is already in the target, then edit it in place - top to bottom -
+        so it ends up matching self.text. Missing parts are typed in; extra parts are
+        removed with Backspace. Caret moves only with the Left/Right arrows; the Delete
+        and Insert keys are never used."""
+        import difflib
+        self._set_state("typing", "Reading the document...")
+        self._acct_mark = self.now()
+        read = getattr(self.kb, "read_document", None)
+        existing = ""
+        if read is not None:
+            try:
+                existing = read() or ""
+            except Exception:
+                existing = ""
+        existing = existing.replace("\r\n", "\n").replace("\r", "\n")
+        desired = self.text
+        self.total = len(desired)
+        # put the caret at the very start - the "starting point of the inspection"
+        goto_start = getattr(self.kb, "caret_to_start", None)
+        if goto_start is not None:
+            try:
+                goto_start()
+            except Exception:
+                pass
+        self._wait(self.rng.uniform(0.2, 0.45))
+        if existing == desired:
+            self.progress = self.total
+            return
+        self._set_state("typing", "")
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, existing, desired, autojunk=False).get_opcodes():
+            self._pause_point()
+            self._guard_focus()
+            if tag == "equal":
+                self._nav_right(i2 - i1)                 # leave the matching text alone
+                self.progress = min(self.total, self.progress + (j2 - j1))
+            elif tag == "insert":
+                self._type_run(desired[j1:j2])           # type the missing text
+                self.edits_inserted += (j2 - j1)
+                self.progress = min(self.total, self.progress + (j2 - j1))
+            elif tag == "delete":
+                self._nav_right(i2 - i1)                 # step past the extra text, then
+                self._backspaces(i2 - i1)                # remove it from the right edge
+                self.edits_deleted += (i2 - i1)
+            else:  # replace
+                self._nav_right(i2 - i1)
+                self._backspaces(i2 - i1)
+                self.edits_deleted += (i2 - i1)
+                self._type_run(desired[j1:j2])
+                self.edits_inserted += (j2 - j1)
+                self.progress = min(self.total, self.progress + (j2 - j1))
+        self._acct_flush()
+
 
 # --------------------------------------------------------------------------- Windows backend
 
@@ -976,6 +1090,31 @@ if sys.platform == "win32":
     kernel32.GetConsoleWindow.restype = wintypes.HWND
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+    # --- mouse lock (low-level mouse hook), clipboard read, and a message pump ---
+    LRESULT = ctypes.c_ssize_t
+    HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
+    user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    user32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    user32.CallNextHookEx.restype = LRESULT
+    user32.UnhookWindowsHookEx.argtypes = (ctypes.c_void_p,)
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT)
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+    user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+    user32.PostThreadMessageW.argtypes = (wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    user32.OpenClipboard.argtypes = (wintypes.HWND,)
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = (wintypes.UINT,)
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.restype = wintypes.BOOL
+    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+
     INPUT_KEYBOARD = 1
     KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
@@ -986,11 +1125,94 @@ if sys.platform == "win32":
     VK_LEFT, VK_RIGHT = 0x25, 0x27
     VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU = 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5
     VK_F8, VK_F9 = 0x77, 0x78
+    VK_HOME = 0x24
     WM_HOTKEY = 0x0312
+    WM_QUIT = 0x0012
+    WH_MOUSE_LL = 14
+    HC_ACTION = 0
+    CF_UNICODETEXT = 13
     SW_RESTORE = 9
     _SPECIALS = {"enter": (VK_RETURN, False), "backspace": (VK_BACK, False), "tab": (VK_TAB, False),
                  "left": (VK_LEFT, True), "right": (VK_RIGHT, True)}
     _VK_PATH_PUNCT = set(".,;:'\"!?-()")
+    # mouse messages to swallow while the lock is on: button down/up, double-clicks and
+    # wheels. Plain movement (0x0200) is left alone, so the pointer still moves.
+    _BLOCK_MOUSE = frozenset((0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206,
+                              0x0207, 0x0208, 0x0209, 0x020A, 0x020B, 0x020C, 0x020D, 0x020E))
+
+    def _read_clipboard_text() -> str:
+        """The target's text after Ctrl+A/Ctrl+C. '' if the clipboard has no text."""
+        if not user32.OpenClipboard(None):
+            return ""
+        try:
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return ""
+            p = kernel32.GlobalLock(h)
+            if not p:
+                return ""
+            try:
+                return ctypes.wstring_at(p)
+            finally:
+                kernel32.GlobalUnlock(h)
+        finally:
+            user32.CloseClipboard()
+
+    class _MouseLock:
+        """Swallows physical mouse clicks (and the wheel) while active, via a low-level
+        mouse hook on its own message-pump thread. The keyboard is untouched, so F8/F9
+        and Ctrl+Alt+Del keep working, and engine keystrokes (SendInput) are unaffected.
+        Low-level hooks fail OPEN: if anything goes wrong the worst case is that clicks
+        are not blocked, never that the mouse stays stuck."""
+
+        def __init__(self):
+            self._on = False
+            self._thread = None
+            self._tid = 0
+            self._proc = None      # keep the CFUNCTYPE alive while hooked
+            self._lock = threading.Lock()
+
+        def set(self, on: bool) -> None:
+            with self._lock:
+                if on and not self._on:
+                    self._on = True
+                    self._thread = threading.Thread(target=self._run, name="typer-mouselock", daemon=True)
+                    self._thread.start()
+                elif not on and self._on:
+                    self._on = False
+                    if self._tid:
+                        try:
+                            user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+                        except Exception:
+                            pass
+
+        def _run(self) -> None:
+            def proc(nCode, wParam, lParam):
+                if nCode == HC_ACTION and self._on and int(wParam) in _BLOCK_MOUSE:
+                    return 1   # swallow the click / wheel
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            self._proc = HOOKPROC(proc)
+            try:
+                hmod = kernel32.GetModuleHandleW(None)
+                hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, hmod, 0)
+            except Exception:
+                hook = None
+            if not hook:
+                self._proc = None
+                return
+            self._tid = kernel32.GetCurrentThreadId()
+            msg = wintypes.MSG()
+            try:
+                while self._on and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            finally:
+                try:
+                    user32.UnhookWindowsHookEx(hook)
+                except Exception:
+                    pass
+                self._tid = 0
+                self._proc = None
 
     class WindowsKeyboard:
         """Real keystrokes.
@@ -1008,6 +1230,7 @@ if sys.platform == "win32":
 
         def __init__(self, rng: random.Random | None = None):
             self.rng = rng or random.Random()
+            self._mouselock = None
 
         @staticmethod
         def _ki(vk: int, scan: int, flags: int) -> "INPUT":
@@ -1069,6 +1292,37 @@ if sys.platform == "win32":
                 self._ki(VK_CONTROL, cs, KEYEVENTF_KEYUP),
             ])
             self._settle(0.018, 0.030)
+
+        def set_mouse_lock(self, on: bool) -> None:
+            """Block (or release) physical mouse clicks on the target while typing."""
+            if self._mouselock is None:
+                if not on:
+                    return
+                self._mouselock = _MouseLock()
+            self._mouselock.set(bool(on))
+
+        def read_document(self) -> str:
+            """Select all (Ctrl+A), copy (Ctrl+C), and return the target's text."""
+            self.chord("a")
+            self._settle(0.04, 0.07)
+            self.chord("c")
+            self._settle(0.08, 0.14)      # let the target put the text on the clipboard
+            try:
+                return _read_clipboard_text()
+            except Exception:
+                return ""
+
+        def caret_to_start(self) -> None:
+            """Ctrl+Home: collapse any selection and go to the very start of the document."""
+            cs = user32.MapVirtualKeyW(VK_CONTROL, 0)
+            hs = user32.MapVirtualKeyW(VK_HOME, 0)
+            self._emit([
+                self._ki(VK_CONTROL, cs, 0),
+                self._ki(VK_HOME, hs, KEYEVENTF_EXTENDEDKEY),
+                self._ki(VK_HOME, hs, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+                self._ki(VK_CONTROL, cs, KEYEVENTF_KEYUP),
+            ])
+            self._settle(0.03, 0.05)
 
         def release_all(self) -> None:
             for vk in (VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU):

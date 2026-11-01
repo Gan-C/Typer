@@ -1,17 +1,19 @@
-; Inno Setup script for the Typer build (app folder + PyTorch + model bundled).
-; Builds Typer-Setup.exe. build.bat compiles it for you; or by hand:
-;   ISCC /DSourceDir=<folder containing the "Typer" app folder> /O<output dir> installer.iss
+; Inno Setup script for Typer -> builds Output\Typer-Setup.exe (the installer wizard).
+;
+; 1. Build the app first:   pyinstaller typer.spec   (creates dist\Typer.exe)
+; 2. Install Inno Setup:    https://jrsoftware.org/isdl.php
+; 3. Compile this script:   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+;
+; build_installer.bat does all of this for you.
+;
+; The wizard this produces: a welcome page, a "choose install location" page
+; (defaults to a new Typer folder), a progress bar while it copies, and a finish
+; page with "Create a desktop shortcut" and "Launch Typer now" - just like a normal app.
 
 #define MyAppName "Typer"
 #define MyAppVersion "1.0"
 #define MyAppPublisher "Gan Chen"
 #define MyAppExeName "Typer.exe"
-#ifndef SourceDir
-  #define SourceDir "dist"
-#endif
-#ifndef OutName
-  #define OutName "Typer-Setup"
-#endif
 
 [Setup]
 AppName={#MyAppName}
@@ -20,11 +22,12 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputBaseFilename={#OutName}
+OutputBaseFilename=Typer-Setup
 SetupIconFile=typer_icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; let the user install per-user (no admin) or for all users
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
@@ -35,12 +38,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-; the whole onedir app folder (Typer.exe + _internal with torch + models)
-Source: "{#SourceDir}\Typer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Typer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "typer_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\typer_icon.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\typer_icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: nowait postinstall skipifsilent

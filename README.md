@@ -126,13 +126,21 @@ install_inno.bat      :: once - fetches & installs Inno Setup silently (for the 
 build.bat             :: builds the app + installer
 ```
 
+**After the first build, to pick up a code change** (you don't need the full build
+again) run **`rebuild.bat`**. It reuses the CPU-PyTorch environment and the model that
+`build.bat` already set up in `C:\TyperBuild`, re-runs only PyInstaller + Inno Setup, and
+refreshes `Output\Typer-Setup.exe` in about a minute or two instead of fifteen.
+
 `build.bat` produces two things in `C:\TyperBuild`:
 
 - **`dist_slim\Typer\Typer.exe`** — a portable, windowless app folder. Copy the whole
   `Typer` folder anywhere and double-click the exe; no Python, no install.
 - **`Output\Typer-Setup.exe`** — an installer wizard: choose a location, progress bar,
   and a finish page with *Create a desktop shortcut* + *Launch now*. Per-user (no
-  admin), typewriter icon baked in, no console window.
+  admin), typewriter icon baked in, no console window. **Updating is just re-running it:**
+  it installs over the previous version in place, and if Typer is open at the time the
+  installer closes it first (via the Windows Restart Manager, keyed to Typer's
+  single-instance mutex) so the update can't fail on a locked `Typer.exe` or model DLL.
 
 **DistilGPT-2 and PyTorch are bundled**, so the AI *revise* feature works with **zero
 setup** on the recipient's machine (no Python, no pip, no model download). `build.bat`
